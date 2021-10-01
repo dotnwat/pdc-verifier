@@ -24,6 +24,7 @@ var (
 	producers = flag.Int("producers", 1, "number of producers")
 	consumers = flag.Int("consumers", 1, "number of consumers")
 	messages  = flag.Int64("messages", 200000, "number of messages to produce")
+	logLevel  = flag.String("log-level", "error", "franz-go log level")
 )
 
 func die(msg string, args ...interface{}) {
@@ -47,6 +48,23 @@ func newRecord(producerId int, sequence int64) *kgo.Record {
 	var r *kgo.Record
 	r = kgo.KeySliceRecord(key.Bytes(), key.Bytes())
 	return r
+}
+
+func appendLogLevel(opts []kgo.Opt) []kgo.Opt {
+	switch strings.ToLower(*logLevel) {
+	case "":
+	case "debug":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, nil)))
+	case "info":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelInfo, nil)))
+	case "warn":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelWarn, nil)))
+	case "error":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelError, nil)))
+	default:
+		die("unrecognized log level %s", *logLevel)
+	}
+	return opts
 }
 
 type Verifier struct {
@@ -183,7 +201,7 @@ func (v *Verifier) Consume() {
 	if *group != "" {
 		opts = append(opts, kgo.ConsumerGroup(*group))
 	}
-
+	opts = appendLogLevel(opts)
 	client, err := kgo.NewClient(opts...)
 	chk(err, "unable to initialize client: %v", err)
 
@@ -216,6 +234,7 @@ func (v *Verifier) Produce(producerId int) {
 	if *linger != 0 {
 		opts = append(opts, kgo.ProducerLinger(*linger))
 	}
+	opts = appendLogLevel(opts)
 
 	client, err := kgo.NewClient(opts...)
 	chk(err, "unable to initialize client: %v", err)
