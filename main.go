@@ -7,6 +7,7 @@ import (
 	"fmt"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,8 +20,7 @@ var (
 	brokers = flag.String("brokers", "localhost:9092", "comma delimited list of brokers")
 	topic   = flag.String("topic", "", "topic to produce to or consume from")
 	linger  = flag.Duration("linger", 0, "if non-zero, linger to use when producing")
-
-	group = flag.String("group", "", "consumer group")
+	group   = flag.String("group", "", "consumer group")
 )
 
 func die(msg string, args ...interface{}) {
@@ -34,51 +34,65 @@ func chk(err error, msg string, args ...interface{}) {
 	}
 }
 
-// TODO: write a variable length random value that can later be verified by
-// doing something like using the key as a seed to into a random bytes
-// generator. maybe even include the producer id and crc.
-func newRecord(id int, num int64) *kgo.Record {
+// TODO: generate random data for the value. the value should be verifiable in
+// terms of both data integrity and that the value is the correct value for the
+// associated key.
+func newRecord(producerId int, sequence int64) *kgo.Record {
 	var key bytes.Buffer
-	fmt.Fprintf(&key, "%06d.%018d", id, num)
+	fmt.Fprintf(&key, "%06d.%018d", producerId, sequence)
 
 	var r *kgo.Record
 	r = kgo.KeySliceRecord(key.Bytes(), key.Bytes())
 	return r
 }
 
-type StreamJoiner struct {
-	lock     sync.Mutex
-	produced map[int32]map[int64][]byte
-	consumed map[int32]map[int64][]byte
+type Verifier struct {
+	lock sync.Mutex
+
+	// map[partition][offset] -> key
+	producedRecords map[int32]map[int64][]byte
+	consumedRecords map[int32]map[int64][]byte
+
+	totalProduced int64
+	totalConsumed int64
+
+	produceCtx    context.Context
+	cancelProduce func()
+
+	wg sync.WaitGroup
 }
 
-func NewStreamJoiner() StreamJoiner {
-	return StreamJoiner{
-		produced: make(map[int32]map[int64][]byte),
-		consumed: make(map[int32]map[int64][]byte),
+func NewVerifier() Verifier {
+	produceCtx, cancelProduce := context.WithCancel(context.Background())
+
+	return Verifier{
+		producedRecords: make(map[int32]map[int64][]byte),
+		consumedRecords: make(map[int32]map[int64][]byte),
+		produceCtx:      produceCtx,
+		cancelProduce:   cancelProduce,
 	}
 }
 
-func (s *StreamJoiner) ProduceRecord(r *kgo.Record) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+func (v *Verifier) ProduceRecord(r *kgo.Record) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 
-	if partition, ok := s.produced[r.Partition]; ok {
+	if partition, ok := v.producedRecords[r.Partition]; ok {
 		if _, ok := partition[r.Offset]; ok {
 			die("produced duplicate offset")
 		}
 		partition[r.Offset] = r.Key
 	} else {
-		s.produced[r.Partition] = make(map[int64][]byte)
-		s.produced[r.Partition][r.Offset] = r.Key
+		v.producedRecords[r.Partition] = make(map[int64][]byte)
+		v.producedRecords[r.Partition][r.Offset] = r.Key
 	}
 }
 
-func (s *StreamJoiner) ConsumeRecord(r *kgo.Record) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+func (v *Verifier) ConsumeRecord(r *kgo.Record) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 
-	if partition, ok := s.produced[r.Partition]; ok {
+	if partition, ok := v.producedRecords[r.Partition]; ok {
 		if key, ok := partition[r.Offset]; ok {
 			if !bytes.Equal(key, r.Key) {
 				die("mismatched keys")
@@ -93,7 +107,7 @@ func (s *StreamJoiner) ConsumeRecord(r *kgo.Record) {
 	// register the record in the tracking data structure, or (2) the
 	// topic contained extra records, or (3) bugs!
 
-	if partition, ok := s.consumed[r.Partition]; ok {
+	if partition, ok := v.consumedRecords[r.Partition]; ok {
 		if key, ok := partition[r.Offset]; ok {
 			if !bytes.Equal(key, r.Key) {
 				die("mismatched keys")
@@ -102,18 +116,20 @@ func (s *StreamJoiner) ConsumeRecord(r *kgo.Record) {
 		}
 		partition[r.Offset] = r.Key
 	} else {
-		s.consumed[r.Partition] = make(map[int64][]byte)
-		s.consumed[r.Partition][r.Offset] = r.Key
+		v.consumedRecords[r.Partition] = make(map[int64][]byte)
+		v.consumedRecords[r.Partition][r.Offset] = r.Key
 	}
 }
 
-func (s *StreamJoiner) PrintSummary() {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	for partition, offsets := range s.consumed {
+// A record may be consumed before it is registered in the index by the
+// producer. If this happens then the consumer registers the record, and this
+// reconcillation method replays the consumed records against the latest
+// producer state. This should happen rarely, so it's efficient to call whenever
+// convenient (e.g. before printing periodic stats, reports).
+func (v *Verifier) reconcile() {
+	for partition, offsets := range v.consumedRecords {
 		for offset, consumed_key := range offsets {
-			if partition, ok := s.produced[partition]; ok {
+			if partition, ok := v.producedRecords[partition]; ok {
 				if produced_key, ok := partition[offset]; ok {
 					if !bytes.Equal(consumed_key, produced_key) {
 						die("key mismatch")
@@ -123,26 +139,30 @@ func (s *StreamJoiner) PrintSummary() {
 			}
 		}
 	}
+}
 
-	for partition, offsets := range s.produced {
+func (v *Verifier) printSummary() {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+	v.reconcile()
+	for partition, offsets := range v.producedRecords {
 		fmt.Println("Partition:", partition, "Unconsumed offsets:", len(offsets))
 	}
 }
 
-type Verifier struct {
-	joiner   StreamJoiner
-	produced int64
-	consumed int64
-}
-
-func NewVerifier() Verifier {
-	return Verifier{
-		joiner: NewStreamJoiner(),
+func (v *Verifier) PrintSummary() {
+	for range time.Tick(time.Second * 3) {
+		if atomic.LoadInt64(&v.totalProduced) > 10000 {
+			v.Stop()
+		}
+		v.printSummary()
+		fmt.Println("Total produced", atomic.LoadInt64(&v.totalProduced),
+			"consumed", atomic.LoadInt64(&v.totalConsumed))
 	}
 }
 
-func (v *Verifier) Consume(wg *sync.WaitGroup) {
-	defer wg.Done()
+func (v *Verifier) Consume() {
+	defer v.wg.Done()
 
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(strings.Split(*brokers, ",")...),
@@ -164,14 +184,14 @@ func (v *Verifier) Consume(wg *sync.WaitGroup) {
 		})
 
 		fetches.EachRecord(func(r *kgo.Record) {
-			atomic.AddInt64(&v.consumed, 1)
-			v.joiner.ConsumeRecord(r)
+			atomic.AddInt64(&v.totalConsumed, 1)
+			v.ConsumeRecord(r)
 		})
 	}
 }
 
-func (v *Verifier) Produce(wg *sync.WaitGroup, id int) {
-	defer wg.Done()
+func (v *Verifier) Produce(producerId int) {
+	defer v.wg.Done()
 
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(strings.Split(*brokers, ",")...),
@@ -189,43 +209,68 @@ func (v *Verifier) Produce(wg *sync.WaitGroup, id int) {
 	client, err := kgo.NewClient(opts...)
 	chk(err, "unable to initialize client: %v", err)
 
-	var num int64
+	handler := func(r *kgo.Record, err error) {
+		chk(err, "produce error: %v", err)
+		atomic.AddInt64(&v.totalProduced, 1)
+		v.ProduceRecord(r)
+	}
+
+	var sequence int64
 	for {
-		client.Produce(context.Background(), newRecord(id, num), func(r *kgo.Record, err error) {
-			chk(err, "produce error: %v", err)
-			atomic.AddInt64(&v.produced, 1)
-			v.joiner.ProduceRecord(r)
-		})
-		num++
+		select {
+		case <-v.produceCtx.Done():
+			break
+		default:
+			r := newRecord(producerId, sequence)
+			// TODO we should probably be passing in a cancellable context but
+			// when we do that we also need to deal with the handler receiving
+			// the context cancelled error.
+			client.Produce(context.Background(), r, handler)
+			sequence++
+		}
 	}
 }
 
-func (v *Verifier) PrintSummary() {
-	for range time.Tick(time.Second * 3) {
-		v.joiner.PrintSummary()
-		fmt.Println("Total produced", atomic.LoadInt64(&v.produced),
-			"consumed", atomic.LoadInt64(&v.consumed))
+func (v *Verifier) Start() {
+	for i := 0; i < 1; i++ {
+		v.wg.Add(1)
+		go v.Consume()
 	}
+
+	for i := 0; i < 1; i++ {
+		v.wg.Add(1)
+		go v.Produce(i)
+	}
+
+	go v.PrintSummary()
+}
+
+func (v *Verifier) Stop() {
+	v.cancelProduce()
+}
+
+func (v *Verifier) Done() <-chan struct{} {
+	return v.produceCtx.Done()
+}
+
+func (v *Verifier) Wait() {
+	v.wg.Wait()
 }
 
 func main() {
 	flag.Parse()
 
 	verifier := NewVerifier()
+	verifier.Start()
 
-	go verifier.PrintSummary()
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
 
-	var wg sync.WaitGroup
-
-	for i := 0; i < 1; i++ {
-		wg.Add(1)
-		go verifier.Consume(&wg)
+	select {
+	case <-c:
+		verifier.Stop()
+	case <-verifier.Done():
 	}
 
-	for i := 0; i < 1; i++ {
-		wg.Add(1)
-		go verifier.Produce(&wg, i)
-	}
-
-	wg.Wait()
+	verifier.Wait()
 }
