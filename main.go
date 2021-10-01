@@ -17,10 +17,14 @@ import (
 )
 
 var (
-	brokers = flag.String("brokers", "localhost:9092", "comma delimited list of brokers")
-	topic   = flag.String("topic", "", "topic to produce to or consume from")
-	linger  = flag.Duration("linger", 0, "if non-zero, linger to use when producing")
-	group   = flag.String("group", "", "consumer group")
+	brokers   = flag.String("brokers", "localhost:9092", "comma delimited list of brokers")
+	topic     = flag.String("topic", "", "topic to produce to or consume from")
+	linger    = flag.Duration("linger", 0, "if non-zero, linger to use when producing")
+	group     = flag.String("group", "", "consumer group")
+	producers = flag.Int("producers", 1, "number of producers")
+	consumers = flag.Int("consumers", 1, "number of consumers")
+	messages  = flag.Int64("messages", 200000, "number of messages to produce")
+	logLevel  = flag.String("log-level", "error", "franz-go log level")
 )
 
 func die(msg string, args ...interface{}) {
@@ -46,6 +50,23 @@ func newRecord(producerId int, sequence int64) *kgo.Record {
 	return r
 }
 
+func appendLogLevel(opts []kgo.Opt) []kgo.Opt {
+	switch strings.ToLower(*logLevel) {
+	case "":
+	case "debug":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, nil)))
+	case "info":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelInfo, nil)))
+	case "warn":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelWarn, nil)))
+	case "error":
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelError, nil)))
+	default:
+		die("unrecognized log level %s", *logLevel)
+	}
+	return opts
+}
+
 type Verifier struct {
 	lock sync.Mutex
 
@@ -55,6 +76,8 @@ type Verifier struct {
 
 	totalProduced int64
 	totalConsumed int64
+	lastProduced  int64
+	lastConsumed  int64
 
 	produceCtx    context.Context
 	cancelProduce func()
@@ -151,13 +174,19 @@ func (v *Verifier) printSummary() {
 }
 
 func (v *Verifier) PrintSummary() {
-	for range time.Tick(time.Second * 3) {
-		if atomic.LoadInt64(&v.totalProduced) > 10000 {
+	const interval_seconds = 3
+	for range time.Tick(time.Second * interval_seconds) {
+		produced := atomic.LoadInt64(&v.totalProduced)
+		consumed := atomic.LoadInt64(&v.totalConsumed)
+		if produced > *messages {
 			v.Stop()
 		}
 		v.printSummary()
-		fmt.Println("Total produced", atomic.LoadInt64(&v.totalProduced),
-			"consumed", atomic.LoadInt64(&v.totalConsumed))
+		fmt.Printf("Total produced %d (%.2f msg/sec), total consumed: %d (%.2f msg/sec)\n",
+			produced, (float64)(produced-v.lastProduced)/3.0, consumed,
+			(float64)(consumed-v.lastConsumed)/3.0)
+		v.lastConsumed = consumed
+		v.lastProduced = produced
 	}
 }
 
@@ -172,7 +201,7 @@ func (v *Verifier) Consume() {
 	if *group != "" {
 		opts = append(opts, kgo.ConsumerGroup(*group))
 	}
-
+	opts = appendLogLevel(opts)
 	client, err := kgo.NewClient(opts...)
 	chk(err, "unable to initialize client: %v", err)
 
@@ -205,6 +234,7 @@ func (v *Verifier) Produce(producerId int) {
 	if *linger != 0 {
 		opts = append(opts, kgo.ProducerLinger(*linger))
 	}
+	opts = appendLogLevel(opts)
 
 	client, err := kgo.NewClient(opts...)
 	chk(err, "unable to initialize client: %v", err)
@@ -232,12 +262,12 @@ func (v *Verifier) Produce(producerId int) {
 }
 
 func (v *Verifier) Start() {
-	for i := 0; i < 1; i++ {
+	for i := 0; i < *consumers; i++ {
 		v.wg.Add(1)
 		go v.Consume()
 	}
 
-	for i := 0; i < 1; i++ {
+	for i := 0; i < *producers; i++ {
 		v.wg.Add(1)
 		go v.Produce(i)
 	}
