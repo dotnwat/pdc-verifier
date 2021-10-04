@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/plugin/kprom"
 )
 
 var (
@@ -230,6 +232,10 @@ func (v *Verifier) Produce(producerId int) {
 		kgo.DisableIdempotentWrite(),
 		kgo.ProducerBatchCompression(kgo.NoCompression()),
 	}
+
+	metrics := kprom.NewMetrics("kgo")
+	http.Handle("/metrics", metrics.Handler())
+	opts = append(opts, kgo.WithHooks(metrics))
 
 	if *linger != 0 {
 		opts = append(opts, kgo.ProducerLinger(*linger))
