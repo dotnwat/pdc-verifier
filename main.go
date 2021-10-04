@@ -27,6 +27,7 @@ var (
 	consumers = flag.Int("consumers", 1, "number of consumers")
 	messages  = flag.Int64("messages", 200000, "number of messages to produce")
 	logLevel  = flag.String("log-level", "error", "franz-go log level")
+	pprofPort   = flag.String("pprof", ":9876", "port to bind to for pprof, if non-empty")
 )
 
 func die(msg string, args ...interface{}) {
@@ -236,6 +237,11 @@ func (v *Verifier) Produce(producerId int) {
 	metrics := kprom.NewMetrics("kgo")
 	http.Handle("/metrics", metrics.Handler())
 	opts = append(opts, kgo.WithHooks(metrics))
+
+	go func() {
+		err := http.ListenAndServe(*pprofPort, nil)
+		chk(err, "unable to run pprof listener: %v", err)
+	}()
 
 	if *linger != 0 {
 		opts = append(opts, kgo.ProducerLinger(*linger))
