@@ -1,4 +1,4 @@
-module github.com/dotnwat/kpc-verifier
+module github.com/dotnwat/pdc-verifier
 
 go 1.16
 
